@@ -68,7 +68,7 @@ def run(
         )
 
     def _on_error(member: str, message: str) -> None:
-        typer.echo(f"ERROR {member}: {message}", err=True)
+        typer.echo(f"ERROR file={member}: {message}", err=True)
 
     result = process_input(
         workbook,

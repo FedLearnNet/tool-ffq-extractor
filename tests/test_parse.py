@@ -65,6 +65,22 @@ def test_resolve_questionnaire_date_missing():
         resolve_questionnaire_date(None, cell="A1")
 
 
+def test_resolve_questionnaire_date_rejects_non_date_text():
+    with pytest.raises(ExtractError, match="not a valid date"):
+        resolve_questionnaire_date(
+            "Meat, fish, poultry - Medium serving (size deck of cards)",
+            cell="A4",
+        )
+
+
+def test_resolve_questionnaire_date_accepts_datetime():
+    assert resolve_questionnaire_date(datetime(2026, 9, 14), cell="A1") == "2026-09-14"
+
+
+def test_resolve_questionnaire_date_accepts_iso_string():
+    assert resolve_questionnaire_date("2026-09-14", cell="A1") == "2026-09-14"
+
+
 @pytest.mark.parametrize(
     "label,expected",
     [
@@ -194,6 +210,15 @@ def test_missing_date_cell_errors(tmp_path):
     result = extract_ffq(path, mapping_path=MAPPING)
     assert not result.ok
     assert any("Questionnaire date not found in cell A1" in e for e in result.errors)
+
+
+def test_wrong_date_cell_with_section_header_errors(tmp_path):
+    """A4 is a section header — must fail date validation, not treat text as date."""
+    xlsx = build_synthetic_ffq(tmp_path / "synthetic.xlsx")
+    result = extract_ffq(xlsx, mapping_path=MAPPING, date_cell="A4", patient_id_cell="A3")
+    assert not result.ok
+    assert any("not a valid date" in e for e in result.errors)
+    assert any("A4" in e for e in result.errors)
 
 
 def test_patient_id_from_custom_cell(tmp_path):

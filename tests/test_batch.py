@@ -156,8 +156,38 @@ def test_process_input_single_xlsx_fail_fast(tmp_path):
     )
     assert not result.ok
     assert result.files_failed == 1
+    assert any("bad.xlsx" in m for m, _ in errors)
     assert any("Patient ID" in msg for _, msg in errors)
     assert not list(tmp_path.glob("*.errors.log"))
+
+
+def test_process_zip_invalid_date_cell_reports_filename(tmp_path):
+    a = build_marked_ffq(
+        tmp_path / "a.xlsx", "MAI_A", "Beef (roast / steak)", "Once a day"
+    )
+    zip_path = tmp_path / "batch.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.write(a, arcname="cohort/a.xlsx")
+
+    errors: list[tuple[str, str]] = []
+    result = process_zip(
+        zip_path,
+        tmp_path / "nutrition.csv",
+        mapping_path=MAPPING,
+        date_cell="A4",
+        patient_id_cell="A3",
+        workers=1,
+        error_callback=lambda m, msg: errors.append((m, msg)),
+    )
+
+    assert result.files_ok == 0
+    assert result.files_failed == 1
+    assert any("a.xlsx" in m for m in result.failed_members)
+    assert len(errors) == 1
+    member, message = errors[0]
+    assert "a.xlsx" in member
+    assert "not a valid date" in message
+    assert "A4" in message
 
 
 def test_read_only_parse_matches(tmp_path):

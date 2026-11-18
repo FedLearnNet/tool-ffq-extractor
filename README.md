@@ -67,7 +67,7 @@ ZIP batch behavior:
 | Column | Notes |
 |--------|--------|
 | `Unique Patient ID` | value from `patient_id_cell` (default `A3`); error if blank |
-| `Questionnaire date` | value from `date_cell` (default `A1`); ISO date when Excel stores a date; error if blank |
+| `Questionnaire date` | value from `date_cell` (default `A1`); must be a real date (Excel date or parseable string); error if blank/invalid |
 | `Portion size` | text after ` - ` in section headers when present |
 | `Frequency consumption` | schema codes (`1/D`, `<1/M`, `6+/D`, …) |
 | `Food group` / `Food subgroup` | translated English values from the mapping file |

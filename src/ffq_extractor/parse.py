@@ -123,15 +123,47 @@ def resolve_sheet(workbook, sheet_name: Optional[str] = None):
     return workbook[name]
 
 
+_DATE_STRING_FORMATS = (
+    "%Y-%m-%d",
+    "%d/%m/%Y",
+    "%m/%d/%Y",
+    "%d-%m-%Y",
+    "%Y/%m/%d",
+    "%d.%m.%Y",
+)
+
+
+def _parse_date_string(text: str) -> Optional[str]:
+    """Return ISO date if text is a recognizable date, else None."""
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    try:
+        return date.fromisoformat(cleaned[:10]).isoformat()
+    except ValueError:
+        pass
+    for fmt in _DATE_STRING_FORMATS:
+        try:
+            return datetime.strptime(cleaned, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
 def _format_date(value: object) -> str:
+    """Format a known date value as ISO YYYY-MM-DD, or '' if not a date."""
     if value is None:
         return ""
     if isinstance(value, datetime):
         return value.date().isoformat()
     if isinstance(value, date):
         return value.isoformat()
+    if isinstance(value, bool):
+        return ""
     text = str(value).strip()
-    return text
+    if not text:
+        return ""
+    return _parse_date_string(text) or ""
 
 
 def _cell_text(value: object) -> str:
@@ -149,12 +181,28 @@ def resolve_patient_id(value: object, *, cell: str = "A3") -> str:
 
 
 def resolve_questionnaire_date(value: object, *, cell: str = "A1") -> str:
-    """Require a non-blank questionnaire date in the configured cell."""
-    text = _format_date(value)
-    if text:
-        return text
-    raise ExtractError(f"Questionnaire date not found in cell {cell}")
+    """
+    Require a real date in the configured cell.
 
+    Accepts Excel date/datetime values or common date strings.
+    Non-date text (e.g. section headers) is rejected.
+    """
+    if value is None or _cell_text(value) == "":
+        raise ExtractError(f"Questionnaire date not found in cell {cell}")
+
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+
+    text = _cell_text(value)
+    parsed = _parse_date_string(text)
+    if parsed:
+        return parsed
+
+    raise ExtractError(
+        f"Questionnaire date in cell {cell} is not a valid date (got {text!r})"
+    )
 
 def _parse_portion(section_label: str) -> str:
     if " - " not in section_label:

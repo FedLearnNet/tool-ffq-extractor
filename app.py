@@ -35,7 +35,7 @@ class FfqExtractorApp(BasePrePostProcessApp[MyAppConfig, MyAppInputConfig, MyApp
             )
 
         def _on_error(member: str, message: str) -> None:
-            self.logger.error(f"FFQ extract failed for {member}: {message}")
+            self.logger.error(f"FFQ extract failed file={member}: {message}")
 
         result = process_input(
             archive,
