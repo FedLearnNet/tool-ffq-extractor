@@ -8,8 +8,9 @@ from pyfedappwrap.learning.run_runfig import AppConfig, AppInputConfig, AppOutpu
 @dataclass
 class MyAppConfig(AppConfig):
     workers: int = 4
-    strict: bool = False
-    sheet: str = "Sheet1"
+    sheet: str = ""
+    date_cell: str = "A1"
+    patient_id_cell: str = "A3"
 
 
 @dataclass

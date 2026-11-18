@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import time
 import zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from .export import append_csv_part, init_output_csv, write_part_csv
 from .mapping import default_mapping_path
 from .parse import extract_ffq
 
 EXCEL_SUFFIXES = {".xlsx", ".xlsm"}
+DEFAULT_WORKERS = 4
+MAX_WORKERS = 64
+# Reject individual ZIP members larger than this (uncompressed) to limit memory.
+MAX_MEMBER_BYTES = 50 * 1024 * 1024
 
 # Per-process mapping cache filled by pool initializer
 _WORKER_MAPPING = None
@@ -36,11 +41,17 @@ class BatchResult:
     elapsed_seconds: float = 0.0
     failed_members: List[str] = field(default_factory=list)
     output_csv: Optional[Path] = None
-    error_log: Optional[Path] = None
 
     @property
     def ok(self) -> bool:
         return self.files_failed == 0 and self.files_ok > 0
+
+
+def clamp_workers(workers: Optional[int]) -> int:
+    """Normalize worker count to a safe 1..64 range (default 4)."""
+    if workers is None:
+        return DEFAULT_WORKERS
+    return max(1, min(MAX_WORKERS, int(workers)))
 
 
 def list_excel_members(zip_path: Union[str, Path]) -> List[str]:
@@ -74,7 +85,8 @@ def _process_zip_member(
     zip_path: str,
     member_name: str,
     sheet_name: str,
-    strict: bool,
+    date_cell: str,
+    patient_id_cell: str,
     parts_dir: str,
 ) -> Tuple[str, bool, Optional[str], Dict[str, int], Optional[str]]:
     """
@@ -95,19 +107,31 @@ def _process_zip_member(
     part_path: Optional[Path] = None
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
-            # Unique safe temp name
+            info = zf.getinfo(member_name)
+            if info.file_size > MAX_MEMBER_BYTES:
+                return (
+                    member_name,
+                    False,
+                    None,
+                    counts,
+                    (
+                        f"Member exceeds size limit "
+                        f"({info.file_size} > {MAX_MEMBER_BYTES} bytes)"
+                    ),
+                )
+
             suffix = Path(member_name).suffix or ".xlsx"
             fd, tmp_name = tempfile.mkstemp(prefix="ffq_", suffix=suffix, dir=parts_dir)
             os.close(fd)
             tmp_xlsx = Path(tmp_name)
             with zf.open(member_name, "r") as src, tmp_xlsx.open("wb") as dst:
-                shutil_copy = __import__("shutil").copyfileobj
-                shutil_copy(src, dst, length=8 * 1024 * 1024)
+                shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
 
         result = extract_ffq(
             tmp_xlsx,
             sheet_name=sheet_name,
-            strict=strict,
+            date_cell=date_cell,
+            patient_id_cell=patient_id_cell,
             food_mapping=_WORKER_MAPPING,
             read_only=True,
         )
@@ -126,8 +150,11 @@ def _process_zip_member(
             # Valid empty questionnaire still counts as ok
             return member_name, True, None, counts, None
 
-        safe = member_name.replace("/", "__").replace("\\", "__")
-        part_path = Path(parts_dir) / f"{safe}.part.csv"
+        fd, part_name = tempfile.mkstemp(
+            prefix="ffq_part_", suffix=".part.csv", dir=parts_dir
+        )
+        os.close(fd)
+        part_path = Path(part_name)
         write_part_csv(result.rows, part_path)
         counts["rows"] = len(result.rows)
         return member_name, True, str(part_path), counts, None
@@ -146,41 +173,40 @@ def process_zip(
     output_csv: Union[str, Path],
     *,
     mapping_path: Optional[Union[str, Path]] = None,
-    error_log: Optional[Union[str, Path]] = None,
-    sheet_name: str = "Sheet1",
-    strict: bool = False,
+    sheet_name: str = "",
+    date_cell: str = "A1",
+    patient_id_cell: str = "A3",
     workers: Optional[int] = None,
     progress_every: int = 50,
     progress_callback=None,
+    error_callback: Optional[Callable[[str, str], None]] = None,
 ) -> BatchResult:
     """
     Extract all FFQ Excel members from a ZIP into one Nutrition CSV.
 
-    Designed for 100k+ members: process pool, part CSVs, as-completed merge,
-    sidecar error log (bounded memory).
+    Designed for 100k+ members: process pool, part CSVs, as-completed merge.
+    Failures are reported via error_callback (console / Docker logs).
     """
     zip_path = Path(zip_path)
     output_csv = Path(output_csv)
     mapping_path = Path(mapping_path) if mapping_path else default_mapping_path()
-    error_log_path = (
-        Path(error_log) if error_log else output_csv.with_suffix(output_csv.suffix + ".errors.log")
-    )
 
     members = list_excel_members(zip_path)
     result = BatchResult(
         files_total=len(members),
         output_csv=output_csv,
-        error_log=error_log_path,
     )
     if not members:
-        error_log_path.write_text("No Excel (.xlsx/.xlsm) members found in archive.\n", encoding="utf-8")
+        msg = "No Excel (.xlsx/.xlsm) members found in archive."
+        if error_callback:
+            error_callback(str(zip_path), msg)
         result.files_failed = 1
+        result.failed_members.append(str(zip_path.name))
         return result
 
     init_output_csv(output_csv)
-    error_log_path.write_text("", encoding="utf-8")
 
-    worker_count = max(1, workers if workers is not None else (os.cpu_count() or 4))
+    worker_count = clamp_workers(workers)
     started = time.perf_counter()
     done = 0
 
@@ -196,39 +222,39 @@ def process_zip(
                     str(zip_path),
                     member,
                     sheet_name,
-                    strict,
+                    date_cell,
+                    patient_id_cell,
                     parts_dir,
                 ): member
                 for member in members
             }
 
-            with error_log_path.open("a", encoding="utf-8") as err_handle:
-                for fut in as_completed(futures):
-                    member, ok, part, counts, err = fut.result()
-                    done += 1
-                    result.omitted_blank += counts.get("omitted_blank", 0)
-                    result.omitted_never += counts.get("omitted_never", 0)
-                    result.omitted_na_mapping += counts.get("omitted_na_mapping", 0)
-                    result.omitted_odd_mark += counts.get("omitted_odd_mark", 0)
+            for fut in as_completed(futures):
+                member, ok, part, counts, err = fut.result()
+                done += 1
+                result.omitted_blank += counts.get("omitted_blank", 0)
+                result.omitted_never += counts.get("omitted_never", 0)
+                result.omitted_na_mapping += counts.get("omitted_na_mapping", 0)
+                result.omitted_odd_mark += counts.get("omitted_odd_mark", 0)
 
-                    if ok:
-                        result.files_ok += 1
-                        if part:
-                            result.rows_written += append_csv_part(part, output_csv)
-                            try:
-                                Path(part).unlink(missing_ok=True)
-                            except OSError:
-                                pass
-                    else:
-                        result.files_failed += 1
-                        result.failed_members.append(member)
-                        err_handle.write(f"{member}\t{err or 'unknown error'}\n")
-                        err_handle.flush()
+                if ok:
+                    result.files_ok += 1
+                    if part:
+                        result.rows_written += append_csv_part(part, output_csv)
+                        try:
+                            Path(part).unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                else:
+                    result.files_failed += 1
+                    result.failed_members.append(member)
+                    if error_callback:
+                        error_callback(member, err or "unknown error")
 
-                    if progress_callback and (
-                        done % progress_every == 0 or done == result.files_total
-                    ):
-                        progress_callback(done, result.files_total, result)
+                if progress_callback and (
+                    done % progress_every == 0 or done == result.files_total
+                ):
+                    progress_callback(done, result.files_total, result)
 
     result.elapsed_seconds = time.perf_counter() - started
     return result
@@ -239,11 +265,12 @@ def process_input(
     output_csv: Union[str, Path],
     *,
     mapping_path: Optional[Union[str, Path]] = None,
-    error_log: Optional[Union[str, Path]] = None,
-    sheet_name: str = "Sheet1",
-    strict: bool = False,
+    sheet_name: str = "",
+    date_cell: str = "A1",
+    patient_id_cell: str = "A3",
     workers: Optional[int] = None,
     progress_callback=None,
+    error_callback: Optional[Callable[[str, str], None]] = None,
 ) -> BatchResult:
     """Dispatch single workbook vs ZIP archive."""
     path = Path(input_path)
@@ -253,11 +280,12 @@ def process_input(
             path,
             output_csv,
             mapping_path=mapping_path,
-            error_log=error_log,
             sheet_name=sheet_name,
-            strict=strict,
+            date_cell=date_cell,
+            patient_id_cell=patient_id_cell,
             workers=workers,
             progress_callback=progress_callback,
+            error_callback=error_callback,
         )
 
     # Single workbook — fail-fast
@@ -265,24 +293,22 @@ def process_input(
     from .parse import ExtractError
 
     started = time.perf_counter()
-    error_log_path = (
-        Path(error_log) if error_log else Path(output_csv).with_suffix(".errors.log")
-    )
     batch = BatchResult(
         files_total=1,
         output_csv=Path(output_csv),
-        error_log=error_log_path,
     )
     try:
         extracted = extract_ffq(
             path,
             mapping_path=mapping_path,
             sheet_name=sheet_name,
-            strict=strict,
+            date_cell=date_cell,
+            patient_id_cell=patient_id_cell,
             read_only=True,
         )
     except ExtractError as exc:
-        error_log_path.write_text(f"{path.name}\t{exc}\n", encoding="utf-8")
+        if error_callback:
+            error_callback(path.name, str(exc))
         batch.files_failed = 1
         batch.failed_members.append(path.name)
         batch.elapsed_seconds = time.perf_counter() - started
@@ -294,15 +320,13 @@ def process_input(
     batch.omitted_odd_mark = extracted.omitted_odd_mark
 
     if extracted.errors:
-        error_log_path.write_text(
-            f"{path.name}\t" + "; ".join(extracted.errors) + "\n",
-            encoding="utf-8",
-        )
+        summary = "; ".join(extracted.errors)
+        if error_callback:
+            error_callback(path.name, summary)
         batch.files_failed = 1
         batch.failed_members.append(path.name)
     else:
         write_csv(extracted.rows, output_csv)
-        error_log_path.write_text("", encoding="utf-8")
         batch.files_ok = 1
         batch.rows_written = len(extracted.rows)
 

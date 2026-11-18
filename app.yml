@@ -1,6 +1,6 @@
 info:
-  name: FFQ Extractor
-  slug: ffq-extractor
+  name: FFQ Extractor - Tool
+  slug: tool-ffq-extractor
   type: EXTRACTOR
   shortDescription: Convert FFQ Excel (or a ZIP of many) into microbiome Nutrition CSV rows.
   longDescription: >
@@ -16,14 +16,19 @@ config:
       default: 4
       minValue: 1
       maxValue: 64
-    - name: strict
-      type: BOOLEAN
-      description: Treat warn-level anomalies (odd marks, NA-mapped items) as errors.
-      default: false
     - name: sheet
       type: STRING
-      description: Worksheet name containing the FFQ matrix.
-      default: Sheet1
+      description: >
+        Worksheet name containing the FFQ matrix. Leave empty to use the first sheet.
+      default: ""
+    - name: date_cell
+      type: STRING
+      description: Excel cell (A1-style) holding the questionnaire date.
+      default: A1
+    - name: patient_id_cell
+      type: STRING
+      description: Excel cell (A1-style) holding the unique patient ID.
+      default: A3
   input:
     - name: ffq_archive
       type: PATH

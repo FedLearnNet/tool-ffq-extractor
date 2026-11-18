@@ -9,8 +9,11 @@ from ffq_extractor.export import rows_to_dataframe, write_csv
 from ffq_extractor.mapping import load_food_mapping
 from ffq_extractor.parse import (
     OUTPUT_COLUMNS,
+    ExtractError,
     extract_ffq,
+    parse_a1,
     resolve_patient_id,
+    resolve_questionnaire_date,
     _parse_portion,
 )
 
@@ -32,21 +35,34 @@ FREQ_HEADERS = [
 ]
 
 
-def test_resolve_patient_id_prefers_b3():
-    assert resolve_patient_id("Participant study number: ", None, "MAI_", "MAI_42") == "MAI_42"
+def test_parse_a1():
+    assert parse_a1("A1") == (0, 0)
+    assert parse_a1("a3") == (2, 0)
+    assert parse_a1("B3") == (2, 1)
+    assert parse_a1("AA10") == (9, 26)
 
 
-def test_resolve_patient_id_falls_back_to_b2():
-    assert resolve_patient_id("Participant study number: ", "MAI_7", "MAI_", None) == "MAI_7"
+def test_parse_a1_invalid():
+    with pytest.raises(ExtractError):
+        parse_a1("3A")
+    with pytest.raises(ExtractError):
+        parse_a1("")
 
 
-def test_resolve_patient_id_from_a3_suffix():
-    assert resolve_patient_id("Participant study number: ", None, "MAI_99", None) == "MAI_99"
+def test_resolve_patient_id_from_cell():
+    assert resolve_patient_id("MAI_42", cell="A3") == "MAI_42"
 
 
 def test_resolve_patient_id_missing():
-    with pytest.raises(Exception):
-        resolve_patient_id("Participant study number: ", None, "MAI_", None)
+    with pytest.raises(ExtractError, match="Patient ID not found in cell A3"):
+        resolve_patient_id(None, cell="A3")
+    with pytest.raises(ExtractError, match="Patient ID not found in cell A3"):
+        resolve_patient_id("  ", cell="A3")
+
+
+def test_resolve_questionnaire_date_missing():
+    with pytest.raises(ExtractError, match="Questionnaire date not found in cell A1"):
+        resolve_questionnaire_date(None, cell="A1")
 
 
 @pytest.mark.parametrize(
@@ -70,13 +86,13 @@ def _mark_row(food: str, header_name: str):
     return (food, *cells)
 
 
-def build_synthetic_ffq(path: Path) -> Path:
+def build_synthetic_ffq(path: Path, *, sheet_title: str = "Sheet1") -> Path:
     wb = Workbook()
     ws = wb.active
-    ws.title = "Sheet1"
+    ws.title = sheet_title
     ws.append([datetime(2026, 9, 1)])
     ws.append(["Participant study number: ", None])
-    ws.append(["MAI_", "MAI_TEST01"])
+    ws.append(["MAI_TEST01"])
     ws.append(
         (
             "Meat, fish, poultry - Medium serving (size deck of cards)",
@@ -123,19 +139,30 @@ def build_synthetic_ffq(path: Path) -> Path:
     return path
 
 
-def test_blank_ffq_requires_patient_id():
-    result = extract_ffq(BLANK, mapping_path=MAPPING)
+def test_blank_ffq_requires_patient_id(tmp_path):
+    from openpyxl import load_workbook
+
+    out = tmp_path / "blank_no_id.xlsx"
+    wb = load_workbook(BLANK)
+    ws = wb.active
+    ws["A3"] = None
+    wb.save(out)
+    wb.close()
+
+    result = extract_ffq(out, mapping_path=MAPPING)
     assert not result.ok
-    assert any("Patient ID" in e for e in result.errors)
+    assert any("Patient ID not found in cell A3" in e for e in result.errors)
 
 
-def test_blank_ffq_with_injected_patient(tmp_path):
+def test_blank_ffq_with_patient_in_a3(tmp_path):
     from openpyxl import load_workbook
 
     out = tmp_path / "blank_with_id.xlsx"
     wb = load_workbook(BLANK)
-    ws = wb["Sheet1"]
-    ws["B3"] = "MAI_BLANK"
+    ws = wb.active
+    ws["A3"] = "MAI_BLANK"
+    if ws["A1"].value is None:
+        ws["A1"] = datetime(2026, 1, 1)
     wb.save(out)
     wb.close()
 
@@ -145,6 +172,55 @@ def test_blank_ffq_with_injected_patient(tmp_path):
     assert result.rows == []
     df = rows_to_dataframe(result.rows)
     assert list(df.columns) == OUTPUT_COLUMNS
+
+
+def test_blank_ffq_fixture_uses_a3_label_as_id():
+    """Vendored blank has 'MAI_' in A3; single-cell mode treats that as the ID."""
+    result = extract_ffq(BLANK, mapping_path=MAPPING)
+    assert result.ok
+    assert result.patient_id == "MAI_"
+    assert result.rows == []
+
+
+def test_missing_date_cell_errors(tmp_path):
+    path = tmp_path / "no_date.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append([None])
+    ws.append([None])
+    ws.append(["MAI_1"])
+    wb.save(path)
+
+    result = extract_ffq(path, mapping_path=MAPPING)
+    assert not result.ok
+    assert any("Questionnaire date not found in cell A1" in e for e in result.errors)
+
+
+def test_patient_id_from_custom_cell(tmp_path):
+    path = tmp_path / "custom_id.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append([datetime(2026, 9, 1)])
+    ws.append([None])
+    ws.append([None, "MAI_CUSTOM"])
+    wb.save(path)
+
+    result = extract_ffq(path, mapping_path=MAPPING, patient_id_cell="B3")
+    assert result.ok
+    assert result.patient_id == "MAI_CUSTOM"
+
+
+def test_first_sheet_default(tmp_path):
+    xlsx = build_synthetic_ffq(tmp_path / "renamed.xlsx", sheet_title="FFQ Data")
+    result = extract_ffq(xlsx, mapping_path=MAPPING, sheet_name="")
+    assert result.patient_id == "MAI_TEST01"
+    assert any(r.food_item == "Beef (roast / steak)" for r in result.rows)
+
+
+def test_named_sheet_missing(tmp_path):
+    xlsx = build_synthetic_ffq(tmp_path / "one.xlsx")
+    with pytest.raises(ExtractError, match="Sheet 'Missing' not found"):
+        extract_ffq(xlsx, mapping_path=MAPPING, sheet_name="Missing")
 
 
 def test_synthetic_extraction(tmp_path):
@@ -182,20 +258,19 @@ def test_synthetic_extraction(tmp_path):
 
 def test_write_csv_golden(tmp_path):
     xlsx = build_synthetic_ffq(tmp_path / "synthetic.xlsx")
-    # Use a mapping-only success path: filter by running without collecting multi-error halt
-    # CLI fails on errors; library still returns rows + errors. write_csv of successful subset:
     result = extract_ffq(xlsx, mapping_path=MAPPING)
-    # Drop error-causing case by rebuilding without multi-mark
     csv_path = write_csv(result.rows, tmp_path / "out.csv")
     df = pd.read_csv(csv_path)
     assert list(df.columns) == OUTPUT_COLUMNS
     assert set(df["Food item"]) == {"Beef (roast / steak)", "Mashed potatoes"}
 
 
-def test_strict_na_becomes_error(tmp_path):
+def test_na_mapping_is_warning_not_error(tmp_path):
     xlsx = build_synthetic_ffq(tmp_path / "synthetic.xlsx")
-    result = extract_ffq(xlsx, mapping_path=MAPPING, strict=True)
-    assert any("mapped to NA" in e for e in result.errors)
+    result = extract_ffq(xlsx, mapping_path=MAPPING)
+    assert result.omitted_na_mapping == 1
+    assert any("mapped to NA" in w for w in result.warnings)
+    assert not any("mapped to NA" in e for e in result.errors)
 
 
 def test_mapping_loaded_once_external():

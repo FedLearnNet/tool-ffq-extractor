@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 from openpyxl import load_workbook
 
@@ -29,6 +30,8 @@ OUTPUT_COLUMNS = [
 
 FREQ_COL_START = 1  # column B (0-indexed)
 FREQ_COL_END = 11  # exclusive → columns B–K
+
+_A1_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
 
 
 @dataclass
@@ -75,6 +78,51 @@ class ExtractError(Exception):
     """Fatal FFQ extraction error."""
 
 
+def parse_a1(address: str) -> Tuple[int, int]:
+    """Parse an A1-style address into 0-based (row, col)."""
+    text = (address or "").strip().upper()
+    match = _A1_RE.match(text)
+    if not match:
+        raise ExtractError(
+            f"Invalid cell address {address!r}. Expected A1-style (e.g. A1, B3)."
+        )
+    col_letters, row_digits = match.groups()
+    col = 0
+    for ch in col_letters:
+        col = col * 26 + (ord(ch) - ord("A") + 1)
+    col -= 1
+    row = int(row_digits) - 1
+    if row < 0 or col < 0:
+        raise ExtractError(f"Invalid cell address {address!r}.")
+    return row, col
+
+
+def get_cell(rows: Sequence[Sequence[object]], address: str) -> object:
+    """Return the value at an A1 address, or None if out of bounds."""
+    row_idx, col_idx = parse_a1(address)
+    if row_idx >= len(rows):
+        return None
+    row = rows[row_idx]
+    if col_idx >= len(row):
+        return None
+    return row[col_idx]
+
+
+def resolve_sheet(workbook, sheet_name: Optional[str] = None):
+    """Return the named sheet, or the first sheet when name is blank."""
+    names = list(workbook.sheetnames)
+    if not names:
+        raise ExtractError("Workbook has no worksheets")
+    name = (sheet_name or "").strip()
+    if not name:
+        return workbook[names[0]]
+    if name not in workbook.sheetnames:
+        raise ExtractError(
+            f"Sheet {name!r} not found. Available: {workbook.sheetnames}"
+        )
+    return workbook[name]
+
+
 def _format_date(value: object) -> str:
     if value is None:
         return ""
@@ -86,6 +134,28 @@ def _format_date(value: object) -> str:
     return text
 
 
+def _cell_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def resolve_patient_id(value: object, *, cell: str = "A3") -> str:
+    """Require a non-blank patient ID in the configured cell."""
+    text = _cell_text(value)
+    if text:
+        return text
+    raise ExtractError(f"Patient ID not found in cell {cell}")
+
+
+def resolve_questionnaire_date(value: object, *, cell: str = "A1") -> str:
+    """Require a non-blank questionnaire date in the configured cell."""
+    text = _format_date(value)
+    if text:
+        return text
+    raise ExtractError(f"Questionnaire date not found in cell {cell}")
+
+
 def _parse_portion(section_label: str) -> str:
     if " - " not in section_label:
         # e.g. "The following on bread or vegetables (teaspoon):"
@@ -94,33 +164,6 @@ def _parse_portion(section_label: str) -> str:
             return "teaspoon"
         return ""
     return section_label.split(" - ", 1)[1].strip()
-
-
-def resolve_patient_id(a2: object, b2: object, a3: object, b3: object) -> str:
-    """
-    Prefer B3, else B2, else A3 if it is more than bare 'MAI_'.
-    """
-    for candidate in (b3, b2):
-        if candidate is not None and str(candidate).strip():
-            return str(candidate).strip()
-
-    a3_text = "" if a3 is None else str(a3).strip()
-    if a3_text and a3_text.rstrip("_").upper() != "MAI":
-        # Keep full value (e.g. MAI_12345)
-        return a3_text
-
-    # If A2 somehow holds the id after the label
-    a2_text = "" if a2 is None else str(a2).strip()
-    label = "participant study number:"
-    if a2_text.lower().startswith(label):
-        remainder = a2_text[len(label) :].strip()
-        if remainder:
-            return remainder
-
-    raise ExtractError(
-        "Patient ID not found. Expected a value in B3, B2, or A3 "
-        "(beyond bare 'MAI_')."
-    )
 
 
 def _is_section_header(row: Sequence[object]) -> bool:
@@ -138,8 +181,6 @@ def _select_frequency(
     cells: Sequence[object],
     headers: Sequence[object],
     result: ExtractResult,
-    *,
-    strict: bool,
 ) -> Optional[str]:
     """Return schema frequency code or None if the row should be omitted."""
     marked_indexes: List[int] = []
@@ -168,8 +209,6 @@ def _select_frequency(
         )
         result.warnings.append(msg)
         result.omitted_odd_mark += 1
-        if strict:
-            result.errors.append(msg)
         return None
 
     if odd_marks and marked_indexes:
@@ -178,8 +217,6 @@ def _select_frequency(
             f"for food item {food_item!r}"
         )
         result.warnings.append(msg)
-        if strict:
-            result.errors.append(msg)
 
     if not marked_indexes:
         result.omitted_blank += 1
@@ -206,8 +243,9 @@ def extract_ffq(
     workbook_path: Union[str, Path],
     mapping_path: Optional[Union[str, Path]] = None,
     *,
-    sheet_name: str = "Sheet1",
-    strict: bool = False,
+    sheet_name: str = "",
+    date_cell: str = "A1",
+    patient_id_cell: str = "A3",
     food_mapping: Optional[Dict[str, FoodMapping]] = None,
     read_only: bool = False,
 ) -> ExtractResult:
@@ -215,18 +253,19 @@ def extract_ffq(
     Read an FFQ workbook and return Nutrition rows + diagnostics.
 
     Use read_only=True for batch/ZIP workloads (lower memory).
+    Blank sheet_name selects the first worksheet.
     """
     path = Path(workbook_path)
     mapping = food_mapping if food_mapping is not None else load_food_mapping(mapping_path)
     result = ExtractResult()
 
+    # Validate cell addresses early so bad hyperparams fail clearly.
+    parse_a1(date_cell)
+    parse_a1(patient_id_cell)
+
     wb = load_workbook(path, data_only=True, read_only=read_only)
     try:
-        if sheet_name not in wb.sheetnames:
-            raise ExtractError(
-                f"Sheet {sheet_name!r} not found. Available: {wb.sheetnames}"
-            )
-        ws = wb[sheet_name]
+        ws = resolve_sheet(wb, sheet_name)
         rows = list(ws.iter_rows(values_only=True))
     finally:
         wb.close()
@@ -234,16 +273,20 @@ def extract_ffq(
     if len(rows) < 3:
         raise ExtractError("FFQ sheet has fewer than 3 rows")
 
-    questionnaire_date = _format_date(rows[0][0] if rows[0] else None)
+    try:
+        questionnaire_date = resolve_questionnaire_date(
+            get_cell(rows, date_cell), cell=date_cell.strip().upper() or "A1"
+        )
+    except ExtractError as exc:
+        result.errors.append(str(exc))
+        return result
     result.questionnaire_date = questionnaire_date
 
-    a2 = rows[1][0] if len(rows[1]) > 0 else None
-    b2 = rows[1][1] if len(rows[1]) > 1 else None
-    a3 = rows[2][0] if len(rows[2]) > 0 else None
-    b3 = rows[2][1] if len(rows[2]) > 1 else None
-
     try:
-        patient_id = resolve_patient_id(a2, b2, a3, b3)
+        patient_id = resolve_patient_id(
+            get_cell(rows, patient_id_cell),
+            cell=patient_id_cell.strip().upper() or "A3",
+        )
     except ExtractError as exc:
         result.errors.append(str(exc))
         return result
@@ -280,9 +323,7 @@ def extract_ffq(
         if len(cells) < len(current_headers):
             cells.extend([None] * (len(current_headers) - len(cells)))
 
-        code = _select_frequency(
-            label, cells, current_headers, result, strict=strict
-        )
+        code = _select_frequency(label, cells, current_headers, result)
         if code is None:
             continue
 
@@ -293,8 +334,6 @@ def extract_ffq(
             )
             result.warnings.append(msg)
             result.omitted_na_mapping += 1
-            if strict:
-                result.errors.append(msg)
             continue
 
         result.marked_count += 1

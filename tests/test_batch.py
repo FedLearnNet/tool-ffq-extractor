@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 
 from ffq_extractor.batch import list_excel_members, process_input, process_zip
 from ffq_extractor.parse import OUTPUT_COLUMNS
@@ -38,7 +38,7 @@ def build_marked_ffq(path: Path, patient_id: str, food: str, header: str) -> Pat
     ws.title = "Sheet1"
     ws.append([datetime(2026, 9, 1)])
     ws.append(["Participant study number: ", None])
-    ws.append(["MAI_", patient_id])
+    ws.append([patient_id])
     ws.append(
         (
             "Meat, fish, poultry - Medium serving (size deck of cards)",
@@ -58,7 +58,7 @@ def build_blank_patient_ffq(path: Path) -> Path:
     ws.title = "Sheet1"
     ws.append([datetime(2026, 9, 1)])
     ws.append(["Participant study number: ", None])
-    ws.append(["MAI_", None])
+    ws.append([None])
     ws.append(
         (
             "Meat, fish, poultry - Medium serving (size deck of cards)",
@@ -91,8 +91,6 @@ def test_process_zip_merges_and_logs_failures(tmp_path):
     b = build_marked_ffq(
         tmp_path / "b.xlsx", "MAI_B", "Mashed potatoes", "Once a month"
     )
-    # Mashed potatoes needs potato section header for portion; still valid food in meat section mapping? 
-    # Actually Mashed potatoes in meat section still maps via food name. OK.
     bad = build_blank_patient_ffq(tmp_path / "bad.xlsx")
 
     zip_path = tmp_path / "batch.zip"
@@ -103,14 +101,18 @@ def test_process_zip_merges_and_logs_failures(tmp_path):
         zf.writestr("__MACOSX/._a.xlsx", b"x")
 
     out = tmp_path / "nutrition.csv"
-    err = tmp_path / "errors.log"
+    errors: list[tuple[str, str]] = []
+
+    def _on_error(member: str, message: str) -> None:
+        errors.append((member, message))
+
     result = process_zip(
         zip_path,
         out,
         mapping_path=MAPPING,
-        error_log=err,
         workers=2,
         progress_every=1,
+        error_callback=_on_error,
     )
 
     assert result.files_total == 3
@@ -118,15 +120,14 @@ def test_process_zip_merges_and_logs_failures(tmp_path):
     assert result.files_failed == 1
     assert result.rows_written == 2
     assert any("bad.xlsx" in m for m in result.failed_members)
-    assert err.read_text(encoding="utf-8")
-    assert "Patient ID" in err.read_text(encoding="utf-8")
+    assert any("Patient ID" in msg for _, msg in errors)
+    assert not list(tmp_path.glob("*.errors.log"))
+    assert not list(tmp_path.glob("*.part.csv"))
 
     df = pd.read_csv(out)
     assert list(df.columns) == OUTPUT_COLUMNS
     assert set(df["Unique Patient ID"]) == {"MAI_A", "MAI_B"}
     assert set(df["Food item"]) == {"Beef (roast / steak)", "Mashed potatoes"}
-    # No leftover part files in tmp (temp dir cleaned by process_zip)
-    assert not list(tmp_path.glob("*.part.csv"))
 
 
 def test_process_input_single_xlsx(tmp_path):
@@ -140,15 +141,23 @@ def test_process_input_single_xlsx(tmp_path):
     assert result.rows_written == 1
     df = pd.read_csv(out)
     assert df.iloc[0]["Frequency consumption"] == "6+/D"
+    assert not list(tmp_path.glob("*.errors.log"))
 
 
 def test_process_input_single_xlsx_fail_fast(tmp_path):
     xlsx = build_blank_patient_ffq(tmp_path / "bad.xlsx")
     out = tmp_path / "out.csv"
-    result = process_input(xlsx, out, mapping_path=MAPPING)
+    errors: list[tuple[str, str]] = []
+    result = process_input(
+        xlsx,
+        out,
+        mapping_path=MAPPING,
+        error_callback=lambda m, msg: errors.append((m, msg)),
+    )
     assert not result.ok
     assert result.files_failed == 1
-    assert not out.exists() or out.stat().st_size == 0 or True
+    assert any("Patient ID" in msg for _, msg in errors)
+    assert not list(tmp_path.glob("*.errors.log"))
 
 
 def test_read_only_parse_matches(tmp_path):

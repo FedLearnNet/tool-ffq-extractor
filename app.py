@@ -3,7 +3,7 @@ from pathlib import Path
 from config import MyAppConfig, MyAppInputConfig, MyAppOutputConfig
 from pyfedappwrap.learning.app_types import BasePrePostProcessApp
 
-from ffq_extractor.batch import process_input
+from ffq_extractor.batch import clamp_workers, process_input
 from ffq_extractor.mapping import default_mapping_path
 
 
@@ -15,13 +15,15 @@ class FfqExtractorApp(BasePrePostProcessApp[MyAppConfig, MyAppInputConfig, MyApp
         archive = Path(data.ffq_archive)
         nutrition_csv = Path(".") / "nutrition.csv"
 
-        workers = max(1, int(self.config.workers))
-        sheet = self.config.sheet or "Sheet1"
-        strict = bool(self.config.strict)
+        workers = clamp_workers(self.config.workers)
+        sheet = (self.config.sheet or "").strip()
+        date_cell = (self.config.date_cell or "A1").strip() or "A1"
+        patient_id_cell = (self.config.patient_id_cell or "A3").strip() or "A3"
 
         self.logger.info(
             f"FFQ extract start: input={archive} workers={workers} "
-            f"sheet={sheet!r} strict={strict}"
+            f"sheet={(sheet or '<first>')!r} date_cell={date_cell!r} "
+            f"patient_id_cell={patient_id_cell!r}"
         )
 
         def _progress(done: int, total: int, batch) -> None:
@@ -32,14 +34,19 @@ class FfqExtractorApp(BasePrePostProcessApp[MyAppConfig, MyAppInputConfig, MyApp
                 f"(~{rate:.0f} rows/s)"
             )
 
+        def _on_error(member: str, message: str) -> None:
+            self.logger.error(f"FFQ extract failed for {member}: {message}")
+
         result = process_input(
             archive,
             nutrition_csv,
             mapping_path=default_mapping_path(),
             sheet_name=sheet,
-            strict=strict,
+            date_cell=date_cell,
+            patient_id_cell=patient_id_cell,
             workers=workers,
             progress_callback=_progress,
+            error_callback=_on_error,
         )
 
         self.logger.info(

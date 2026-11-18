@@ -35,26 +35,27 @@ def run(
         help="Mapping workbook (defaults to vendored file)",
     ),
     sheet: str = typer.Option(
-        "Sheet1",
+        "",
         "--sheet",
-        help="Worksheet name containing the FFQ matrix",
+        help="Worksheet name (default: first sheet)",
     ),
-    strict: bool = typer.Option(
-        False,
-        "--strict",
-        help="Treat warn-level anomalies (odd marks, NA-mapped items) as errors",
+    date_cell: str = typer.Option(
+        "A1",
+        "--date-cell",
+        help="Excel cell holding the questionnaire date",
+    ),
+    patient_id_cell: str = typer.Option(
+        "A3",
+        "--patient-id-cell",
+        help="Excel cell holding the unique patient ID",
     ),
     workers: Optional[int] = typer.Option(
         None,
         "--workers",
         "-j",
         min=1,
-        help="Process-pool size for ZIP batch (default: CPU count)",
-    ),
-    error_log: Optional[Path] = typer.Option(
-        None,
-        "--error-log",
-        help="Sidecar failure log (default: <output>.errors.log)",
+        max=64,
+        help="Process-pool size for ZIP batch (default: 4)",
     ),
 ) -> None:
     """Extract FFQ Excel sheets (or a ZIP of them) into Nutrition CSV rows."""
@@ -66,15 +67,19 @@ def run(
             err=True,
         )
 
+    def _on_error(member: str, message: str) -> None:
+        typer.echo(f"ERROR {member}: {message}", err=True)
+
     result = process_input(
         workbook,
         output,
         mapping_path=mapping or default_mapping_path(),
-        error_log=error_log,
         sheet_name=sheet,
-        strict=strict,
+        date_cell=date_cell,
+        patient_id_cell=patient_id_cell,
         workers=workers,
         progress_callback=_progress if workbook.suffix.lower() == ".zip" else None,
+        error_callback=_on_error,
     )
 
     rate = (
@@ -93,8 +98,6 @@ def run(
         f"elapsed={result.elapsed_seconds:.2f}s "
         f"(~{rate:.0f} rows/s)"
     )
-    if result.error_log:
-        typer.echo(f"Error log: {result.error_log}", err=True)
 
     if result.files_failed:
         typer.secho(
